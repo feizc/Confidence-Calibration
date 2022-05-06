@@ -10,7 +10,7 @@ import numpy as np
 import random 
 from torch.optim import Adam
 
-from models import TICModel, TransformerConfig
+from models import C3CapModel, TransformerConfig
 from dataset import ClipCocoDataset 
 from torch.utils.data import Dataset, DataLoader
 import evaluation 
@@ -28,6 +28,22 @@ random.seed(1234)
 torch.manual_seed(1234)
 np.random.seed(1234)
 
+
+
+def confidence_calibration_loss(logits, targets, smooth=0.0, alpha=1.0): 
+    # logits [bsz, seq_len, vocab_size] 
+    # targets [bsz, seq_len] 
+    bsz, seq, vocab = logits.size()
+    true_logprob = nnf.logsigmoid(logits) 
+    false_logprob = torch.log(torch.maximum(1.0 - torch.exp(true_logprob), torch.tensor(1.0e-30).expand_as(true_logprob)))  
+    tgt_true_logprob = torch.gather(true_logprob.view(bsz*seq, vocab), 1, targets.view(bsz*seq,1)).view(bsz, seq) # [bsz, seq]
+    tgt_false_logprob = torch.gather(false_logprob.view(bsz*seq, vocab), 1, targets.view(bsz*seq,1)).view(bsz, seq)
+    tgt_true_xent = -(alpha - 1) * tgt_true_logprob - 1 * tgt_false_logprob 
+    tgt_false_xent = -(alpha - 1) * tgt_false_logprob - 1 * tgt_true_logprob 
+    all_false_xent = - (alpha - 1) * false_logprob - 1 * true_logprob 
+    loss = smooth * (torch.sum(all_false_xent, dim=-1) - tgt_false_xent) + tgt_true_xent 
+    weights = torch.where(targets > 0, 1, 0).float() 
+    return (loss * weights).sum() / weights.sum()
 
 
 
@@ -62,12 +78,12 @@ def evaluate_metrics(model, test_dataloader, tokenizer, epoch):
 def train_xe(model, train_dataloader, args, optimizer, scheduler, epoch): 
     model.train()
     running_loss = .0 
-    progress = tqdm(total=len(train_dataloader), desc='TICModel') 
+    progress = tqdm(total=len(train_dataloader), desc='C3CapModel') 
     for idx, (tokens, labels, _, img_features) in enumerate(train_dataloader):  
         model.zero_grad() 
         tokens, labels, img_features = tokens.to(device), labels.to(device), img_features.to(device, dtype=torch.float32) 
         outputs = model(img_features, tokens) 
-        loss = nnf.cross_entropy(outputs.reshape(-1, outputs.shape[-1]), labels.flatten(), ignore_index=0)
+        loss = confidence_calibration_loss(outputs, labels)
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -139,8 +155,8 @@ def main():
     parser.add_argument('--warmup_steps', default=5000) 
     parser.add_argument('--out_dir', default='./ckpt') 
     parser.add_argument('--model_type', default='tic') 
-    parser.add_argument('--phase', type=str, default='xe', choices=('xe', 'scst'))
-    args = parser.parse_args() 
+    parser.add_argument('--phase', type=str, default='xs', choices=('xe', 'scst'))
+    args = parser.parse_args()
 
     tokenizer = GPT2Tokenizer.from_pretrained(args.tokenizer_path) 
     train_dataset = ClipCocoDataset(args.train_data_path, tokenizer)  
@@ -152,7 +168,7 @@ def main():
     cider_train = Cider(PTBTokenizer.tokenize(ref_caps_train)) 
 
     config = TransformerConfig()
-    model = TICModel(config).to(device) 
+    model = C3CapModel(config).to(device) 
 
     optimizer = AdamW(model.parameters(), lr=args.lr) 
     scheduler = get_linear_schedule_with_warmup(
